@@ -85,6 +85,7 @@ type Controller struct {
 	// Representing the resources to tag
 	resources []string
 
+	// Whether or not to rate limit the first enqueue of work items
 	rateLimitEnabled bool
 }
 
@@ -118,7 +119,12 @@ func NewTaggingController(
 		rateLimitEnabled = true
 	} else {
 		klog.Infof("Rate limit disabled on controller.")
-		rateLimiter = workqueue.DefaultControllerRateLimiter()
+		rateLimiter = workqueue.NewMaxOfRateLimiter(
+			// the default configuration of 5ms for this baseDelay is too short
+			// to produce any difference when requeueing a work item
+			workqueue.NewItemExponentialFailureRateLimiter(1*time.Second, 1000*time.Second),
+			&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+		)
 		rateLimitEnabled = false
 	}
 
@@ -198,7 +204,7 @@ func (tc *Controller) process() bool {
 		return false
 	}
 
-	klog.Infof("Starting to process %s", obj)
+	klog.Infof("Starting to process %s. Size of the workqueue is now %s", obj, tc.workqueue.Len())
 
 	err := func(obj interface{}) error {
 		defer tc.workqueue.Done(obj)
@@ -232,17 +238,18 @@ func (tc *Controller) process() bool {
 		err = workItem.action(workItem.node)
 
 		if err != nil {
-			if workItem.requeuingCount < maxRequeuingCount {
-				// Put the item back on the workqueue to handle any transient errors.
+			if !workItem.safeToQueue() {
+				recordWorkItemErrorMetrics(totalErrorsWorkItemErrorMetric, string(instanceID))
+			} else if workItem.requeuingCount < maxRequeuingCount {
 				workItem.requeuingCount++
 				tc.workqueue.AddRateLimited(workItem)
 
 				recordWorkItemErrorMetrics(totalErrorsWorkItemErrorMetric, string(instanceID))
 				return fmt.Errorf("error processing work item '%v': %s, requeuing count %d", workItem, err.Error(), workItem.requeuingCount)
+			} else {
+				klog.Errorf("error processing work item %s: %s, requeuing count exceeded", workItem, err.Error())
+				recordWorkItemErrorMetrics(errorsAfterRetriesExhaustedWorkItemErrorMetric, string(instanceID))
 			}
-
-			klog.Errorf("error processing work item %s: %s, requeuing count exceeded", workItem, err.Error())
-			recordWorkItemErrorMetrics(errorsAfterRetriesExhaustedWorkItemErrorMetric, string(instanceID))
 		} else {
 			klog.Infof("Finished processing %s", workItem)
 			timeTaken = time.Since(workItem.enqueueTime).Seconds()
@@ -357,6 +364,11 @@ func (tc *Controller) enqueueNode(node *v1.Node, action func(node *v1.Node) erro
 		tc.workqueue.Add(item)
 		klog.Infof("Added %s to the workqueue (without any rate-limit)", item)
 	}
+}
+
+func (wi *workItem) safeToQueue() bool {
+	// check if the node object even exists anymore
+	return true
 }
 
 func (tc *Controller) isTaggingRequired(node *v1.Node) bool {
